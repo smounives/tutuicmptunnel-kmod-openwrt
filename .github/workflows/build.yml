@@ -7,11 +7,8 @@ on:
         description: 'OpenWrt SDK Version'
         required: true
         default: '24.10.5'
-  schedule:
-    - cron: '0 2 * * 1' # 每周一自动编译
 
 env:
-  # 全局配置
   LIBSODIUM_TAG: 1.0.20-RELEASE
   SOURCE_REPO: https://github.com/hrimfaxi/tutuicmptunnel-kmod.git
   SOURCE_DIR: tutuicmptunnel-kmod
@@ -21,15 +18,14 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
     
-    # === 矩阵策略：同时并行编译所有架构 ===
     strategy:
       fail-fast: false
       matrix:
         target:
-          - 'x86/64'              # 软路由
-          - 'mediatek/filogic'    # 小米 AX3000T / 红米 AX6000
-          - 'ramips/mt7621'       # 红米 AC2100 / K2P
-          - 'armsr/armv8'         # 通用 ARMv8
+          - 'x86/64'
+          - 'mediatek/filogic'
+          - 'ramips/mt7621'
+          - 'armsr/armv8'
 
     steps:
     - name: Checkout Builder Repo
@@ -38,14 +34,13 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip python3 zstd bison flex
+        sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip python3 zstd bison flex pkg-config
 
     - name: Configure Architecture & SDK
       id: config
       run: |
         TARGET="${{ matrix.target }}"
         
-        # 确定 SDK 版本
         if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
           SDK_VER="${{ inputs.sdk_version }}"
         else
@@ -55,7 +50,6 @@ jobs:
         echo "Building Target: $TARGET"
         echo "SDK Version: $SDK_VER"
         
-        # 根据 Target 设置架构变量
         case "$TARGET" in
           "x86/64")
             ARCH="x86_64"
@@ -83,14 +77,12 @@ jobs:
             ;;
         esac
         
-        # 构造下载 URL
         if [ "$SDK_VER" == "snapshot" ]; then
           SDK_URL="https://downloads.openwrt.org/snapshots/targets/$TARGET/"
         else
           SDK_URL="https://downloads.openwrt.org/releases/$SDK_VER/targets/$TARGET/"
         fi
 
-        # 导出环境变量
         echo "ARCH=$ARCH" >> $GITHUB_ENV
         echo "KERNEL_ARCH=$KERNEL_ARCH" >> $GITHUB_ENV
         echo "SDK_FILE_PATTERN=$SDK_FILE_PATTERN" >> $GITHUB_ENV
@@ -114,7 +106,6 @@ jobs:
         echo "SDK_HOME=$SDK_HOME" >> $GITHUB_ENV
         echo "STAGING_DIR=$SDK_HOME/staging_dir" >> $GITHUB_ENV
         
-        # 动态获取路径
         TOOLCHAIN_DIR=$(ls -d $SDK_HOME/staging_dir/toolchain-*)
         TARGET_DIR=$(ls -d $SDK_HOME/staging_dir/target-*)
         KERNEL_DIR=$(ls -d $SDK_HOME/build_dir/target-*/linux-*/linux-*)
@@ -123,7 +114,6 @@ jobs:
         echo "TARGET_DIR=$TARGET_DIR" >> $GITHUB_ENV
         echo "KERNEL_DIR=$KERNEL_DIR" >> $GITHUB_ENV
         
-        # 将工具链加入 PATH
         echo "$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
 
     - name: Compile Libsodium (Static & PIC)
@@ -134,7 +124,6 @@ jobs:
         git checkout ${{ env.LIBSODIUM_TAG }}
         ./autogen.sh
         
-        # 注意：这里使用 env.ARCH 动态适配 x86_64/aarch64/mipsel
         ./configure --host=${{ env.ARCH }}-openwrt-linux \
           --disable-ssp --disable-shared --enable-static --with-pic \
           CC=${{ env.ARCH }}-openwrt-linux-musl-gcc
@@ -164,8 +153,6 @@ jobs:
         cd ${{ env.SOURCE_DIR }}
         CMAKE_FILE="toolchains/openwrt-${{ env.ARCH }}.cmake"
         
-        # 根据当前架构生成正确的 CMake 配置文件
-        # 这里的 $TOOLCHAIN_DIR 和 $TARGET_DIR 是绝对路径，彻底避免找不到文件的问题
         cat <<EOF > "$CMAKE_FILE"
         set(CMAKE_SYSTEM_NAME Linux)
         set(CMAKE_SYSTEM_PROCESSOR ${{ env.ARCH }})
@@ -183,10 +170,7 @@ jobs:
         cd ${{ env.SOURCE_DIR }}
         rm -f CMakeCache.txt
         mkdir -p build
-        
         export PKG_CONFIG_LIBDIR="${{ env.TARGET_DIR }}/usr/lib/pkgconfig"
-        export PKG_CONFIG="${{ env.SDK_HOME }}/staging_dir/host/bin/pkg-config"
-        
         cmake \
           -DCMAKE_TOOLCHAIN_FILE=$(pwd)/toolchains/openwrt-${{ env.ARCH }}.cmake \
           -DBISON_EXECUTABLE=/usr/bin/bison \
@@ -220,7 +204,6 @@ jobs:
         cp stripped/usr/local/sbin/ktuctl release/bin/
         cp kmod/tutuicmptunnel.ko release/modules/
         
-        # 产物名带上架构，防止混淆
         ARCH_NAME=$(echo "${{ matrix.target }}" | tr '/' '-')
         TAR_NAME="tutuicmptunnel-openwrt-${ARCH_NAME}-${{ env.SDK_VER }}.tar.gz"
         
