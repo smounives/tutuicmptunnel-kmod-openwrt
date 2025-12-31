@@ -170,7 +170,11 @@ jobs:
         cd ${{ env.SOURCE_DIR }}
         rm -f CMakeCache.txt
         mkdir -p build
+        export PKG_CONFIG="/usr/bin/pkg-config"
         export PKG_CONFIG_LIBDIR="${{ env.TARGET_DIR }}/usr/lib/pkgconfig"
+        export PKG_CONFIG_SYSROOT_DIR="${{ env.TARGET_DIR }}"
+        export PKG_CONFIG_PATH=""
+        
         cmake \
           -DCMAKE_TOOLCHAIN_FILE=$(pwd)/toolchains/openwrt-${{ env.ARCH }}.cmake \
           -DBISON_EXECUTABLE=/usr/bin/bison \
