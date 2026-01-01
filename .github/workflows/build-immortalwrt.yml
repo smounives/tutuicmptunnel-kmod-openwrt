@@ -1,0 +1,188 @@
+name: Build for ImmortalWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: 'ImmortalWrt SDK Version'
+        required: true
+        default: '24.10.4'
+
+env:
+  LIBSODIUM_TAG: 1.0.20-RELEASE
+  SOURCE_REPO: https://github.com/hrimfaxi/tutuicmptunnel-kmod.git
+  SOURCE_DIR: tutuicmptunnel-kmod
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - 'x86/64'
+          - 'mediatek/filogic'
+          - 'ramips/mt7621'
+          - 'armsr/armv8'
+
+    steps:
+    - name: Checkout Builder Repo
+      uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip python3 zstd bison flex pkg-config
+
+    - name: Configure Architecture & SDK
+      id: config
+      run: |
+        TARGET="${{ matrix.target }}"
+        SDK_VER="${{ inputs.sdk_version || '24.10.4' }}"
+        
+        echo "Building Target: $TARGET"
+        echo "SDK Version: $SDK_VER"
+        
+        case "$TARGET" in
+          "x86/64")
+            ARCH="x86_64"; KERNEL_ARCH="x86"; SDK_FILE_PATTERN="immortalwrt-sdk-*-x86-64_*.tar.zst" ;;
+          "mediatek/filogic")
+            ARCH="aarch64"; KERNEL_ARCH="arm64"; SDK_FILE_PATTERN="immortalwrt-sdk-*-mediatek-filogic_*.tar.zst" ;;
+          "armsr/armv8")
+            ARCH="aarch64"; KERNEL_ARCH="arm64"; SDK_FILE_PATTERN="immortalwrt-sdk-*-armsr-armv8_*.tar.zst" ;;
+          "ramips/mt7621")
+            ARCH="mipsel"; KERNEL_ARCH="mips"; SDK_FILE_PATTERN="immortalwrt-sdk-*-ramips-mt7621_*.tar.zst" ;;
+          *)
+            echo "Error: Unknown target $TARGET"; exit 1 ;;
+        esac
+        
+        if [ "$SDK_VER" == "snapshot" ]; then
+          SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/$TARGET/"
+        else
+          SDK_URL="https://downloads.immortalwrt.org/releases/$SDK_VER/targets/$TARGET/"
+        fi
+
+        echo "ARCH=$ARCH" >> $GITHUB_ENV
+        echo "KERNEL_ARCH=$KERNEL_ARCH" >> $GITHUB_ENV
+        echo "SDK_FILE_PATTERN=$SDK_FILE_PATTERN" >> $GITHUB_ENV
+        echo "SDK_URL=$SDK_URL" >> $GITHUB_ENV
+        echo "SDK_VER=$SDK_VER" >> $GITHUB_ENV
+
+    - name: Clone Source Code
+      run: git clone ${{ env.SOURCE_REPO }} ${{ env.SOURCE_DIR }}
+
+    - name: Download and Setup SDK
+      run: |
+        mkdir -p $HOME/temp && cd $HOME/temp
+        
+        echo "Downloading from: ${{ env.SDK_URL }}"
+        wget -r -l1 -np -nd -A "${{ env.SDK_FILE_PATTERN }}" ${{ env.SDK_URL }}
+        tar -I zstd -xf immortalwrt-sdk-*.tar.zst
+        
+        SDK_HOME=$(find $HOME/temp -maxdepth 1 -type d -name "*sdk-*")
+        echo "SDK_HOME=$SDK_HOME" >> $GITHUB_ENV
+        echo "STAGING_DIR=$SDK_HOME/staging_dir" >> $GITHUB_ENV
+        echo "TARGET_DIR=$(ls -d $SDK_HOME/staging_dir/target-*)" >> $GITHUB_ENV
+        echo "KERNEL_DIR=$(ls -d $SDK_HOME/build_dir/target-*/linux-*/linux-*)" >> $GITHUB_ENV
+        
+        TOOLCHAIN_DIR=$(ls -d $SDK_HOME/staging_dir/toolchain-*)
+        echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR" >> $GITHUB_ENV
+        echo "$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
+
+    - name: Compile Libsodium (Static & Shared)
+      run: |
+        cd $HOME/temp
+        git clone https://github.com/jedisct1/libsodium.git
+        cd libsodium
+        git checkout ${{ env.LIBSODIUM_TAG }}
+        ./autogen.sh
+        ./configure --host=${{ env.ARCH }}-openwrt-linux \
+          --enable-shared --enable-static --with-pic \
+          --disable-ssp \
+          CC=${{ env.ARCH }}-openwrt-linux-musl-gcc
+        
+        make -j $(nproc)
+
+    - name: Compile Libmnl
+      run: |
+        cd $HOME/temp
+        git clone https://github.com/justmirror/libmnl
+        cd libmnl
+        ./autogen.sh
+        
+        ./configure \
+          --host=${{ env.ARCH }}-openwrt-linux \
+          --prefix=/usr --exec-prefix=/usr \
+          CC=${{ env.ARCH }}-openwrt-linux-musl-gcc \
+          CFLAGS="--sysroot=${{ env.TARGET_DIR }} -O2 -pipe" \
+          LDFLAGS="--sysroot=${{ env.TARGET_DIR }} -Wl,--gc-sections"
+
+        make clean all
+        make DESTDIR=${{ env.TARGET_DIR }} install
+
+    - name: Generate CMake Toolchain File
+      run: |
+        cd ${{ env.SOURCE_DIR }}
+        CMAKE_FILE="toolchains/openwrt-${{ env.ARCH }}.cmake"
+        cat <<EOF > "$CMAKE_FILE"
+        set(CMAKE_SYSTEM_NAME Linux)
+        set(CMAKE_SYSTEM_PROCESSOR ${{ env.ARCH }})
+        set(CMAKE_C_COMPILER $TOOLCHAIN_DIR/bin/${{ env.ARCH }}-openwrt-linux-musl-gcc)
+        set(CMAKE_STRIP $TOOLCHAIN_DIR/bin/${{ env.ARCH }}-openwrt-linux-musl-strip)
+        set(CMAKE_SYSROOT $TARGET_DIR)
+        include_directories(\${CMAKE_SYSROOT}/usr/include)
+        EOF
+
+    - name: Compile tutuicmptunnel-kmod
+      run: |
+        cd ${{ env.SOURCE_DIR }}
+        rm -f CMakeCache.txt && mkdir -p build
+        
+        export PKG_CONFIG="/usr/bin/pkg-config"
+        export PKG_CONFIG_LIBDIR="${{ env.TARGET_DIR }}/usr/lib/pkgconfig"
+        export PKG_CONFIG_SYSROOT_DIR="${{ env.TARGET_DIR }}"
+        export PKG_CONFIG_PATH=""
+        
+        cmake \
+          -DCMAKE_TOOLCHAIN_FILE=$(pwd)/toolchains/openwrt-${{ env.ARCH }}.cmake \
+          -DBISON_EXECUTABLE=/usr/bin/bison \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DENABLE_HARDEN_MODE=ON \
+          -DSODIUM_INCLUDE_DIR=$HOME/temp/libsodium/src/libsodium/include \
+          -DSODIUM_LIBRARY=$HOME/temp/libsodium/src/libsodium/.libs/libsodium.a \
+          .
+        
+        make VERBOSE=1 clean all
+        make install DESTDIR=stripped
+
+    - name: Compile Kernel Module
+      run: |
+        cd ${{ env.SOURCE_DIR }}
+        make KSRC=${{ env.KERNEL_DIR }} CROSS_COMPILE=${{ env.ARCH }}-openwrt-linux-musl- ARCH=${{ env.KERNEL_ARCH }} -C kmod
+
+    - name: Prepare Artifacts
+      run: |
+        cd ${{ env.SOURCE_DIR }}
+        mkdir -p release/bin
+        mkdir -p release/modules
+        mkdir -p release/lib
+        
+        cp stripped/usr/local/bin/tuctl* release/bin/
+        cp stripped/usr/local/sbin/ktuctl release/bin/
+        cp kmod/tutuicmptunnel.ko release/modules/
+        cp -d $HOME/temp/libsodium/src/libsodium/.libs/libsodium.so* release/lib/
+        
+        ARCH_NAME=$(echo "${{ matrix.target }}" | tr '/' '-')
+        TAR_NAME="tutuicmptunnel-immortalwrt-${ARCH_NAME}-${{ env.SDK_VER }}.tar.gz"
+        
+        cd release
+        tar -czvf ../../$TAR_NAME *
+        echo "ARTIFACT_NAME=$TAR_NAME" >> $GITHUB_ENV
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: ${{ env.ARTIFACT_NAME }}
