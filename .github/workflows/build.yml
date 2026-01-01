@@ -40,41 +40,22 @@ jobs:
       id: config
       run: |
         TARGET="${{ matrix.target }}"
-        
-        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-          SDK_VER="${{ inputs.sdk_version }}"
-        else
-          SDK_VER="24.10.5"
-        fi
+        SDK_VER="${{ inputs.sdk_version || '24.10.5' }}"
         
         echo "Building Target: $TARGET"
         echo "SDK Version: $SDK_VER"
         
         case "$TARGET" in
           "x86/64")
-            ARCH="x86_64"
-            KERNEL_ARCH="x86"
-            SDK_FILE_PATTERN="openwrt-sdk-*-x86-64_*.tar.zst"
-            ;;
+            ARCH="x86_64"; KERNEL_ARCH="x86"; SDK_FILE_PATTERN="openwrt-sdk-*-x86-64_*.tar.zst" ;;
           "mediatek/filogic")
-            ARCH="aarch64"
-            KERNEL_ARCH="arm64"
-            SDK_FILE_PATTERN="openwrt-sdk-*-mediatek-filogic_*.tar.zst"
-            ;;
+            ARCH="aarch64"; KERNEL_ARCH="arm64"; SDK_FILE_PATTERN="openwrt-sdk-*-mediatek-filogic_*.tar.zst" ;;
           "armsr/armv8")
-            ARCH="aarch64"
-            KERNEL_ARCH="arm64"
-            SDK_FILE_PATTERN="openwrt-sdk-*-armsr-armv8_*.tar.zst"
-            ;;
+            ARCH="aarch64"; KERNEL_ARCH="arm64"; SDK_FILE_PATTERN="openwrt-sdk-*-armsr-armv8_*.tar.zst" ;;
           "ramips/mt7621")
-            ARCH="mipsel"
-            KERNEL_ARCH="mips"
-            SDK_FILE_PATTERN="openwrt-sdk-*-ramips-mt7621_*.tar.zst"
-            ;;
+            ARCH="mipsel"; KERNEL_ARCH="mips"; SDK_FILE_PATTERN="openwrt-sdk-*-ramips-mt7621_*.tar.zst" ;;
           *)
-            echo "Error: Unknown target $TARGET"
-            exit 1
-            ;;
+            echo "Error: Unknown target $TARGET"; exit 1 ;;
         esac
         
         if [ "$SDK_VER" == "snapshot" ]; then
@@ -90,33 +71,25 @@ jobs:
         echo "SDK_VER=$SDK_VER" >> $GITHUB_ENV
 
     - name: Clone Source Code
-      run: |
-        git clone ${{ env.SOURCE_REPO }} ${{ env.SOURCE_DIR }}
+      run: git clone ${{ env.SOURCE_REPO }} ${{ env.SOURCE_DIR }}
 
     - name: Download and Setup SDK
       run: |
-        mkdir -p $HOME/temp
-        cd $HOME/temp
-        
-        echo "Downloading SDK..."
+        mkdir -p $HOME/temp && cd $HOME/temp
         wget -r -l1 -np -nd -A "${{ env.SDK_FILE_PATTERN }}" ${{ env.SDK_URL }}
         tar -I zstd -xf openwrt-sdk-*.tar.zst
         
         SDK_HOME=$(find $HOME/temp -maxdepth 1 -type d -name "openwrt-sdk-*")
         echo "SDK_HOME=$SDK_HOME" >> $GITHUB_ENV
         echo "STAGING_DIR=$SDK_HOME/staging_dir" >> $GITHUB_ENV
+        echo "TARGET_DIR=$(ls -d $SDK_HOME/staging_dir/target-*)" >> $GITHUB_ENV
+        echo "KERNEL_DIR=$(ls -d $SDK_HOME/build_dir/target-*/linux-*/linux-*)" >> $GITHUB_ENV
         
         TOOLCHAIN_DIR=$(ls -d $SDK_HOME/staging_dir/toolchain-*)
-        TARGET_DIR=$(ls -d $SDK_HOME/staging_dir/target-*)
-        KERNEL_DIR=$(ls -d $SDK_HOME/build_dir/target-*/linux-*/linux-*)
-        
         echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR" >> $GITHUB_ENV
-        echo "TARGET_DIR=$TARGET_DIR" >> $GITHUB_ENV
-        echo "KERNEL_DIR=$KERNEL_DIR" >> $GITHUB_ENV
-        
         echo "$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
 
-    - name: Compile Libsodium (Static & PIC)
+    - name: Compile Libsodium (Static & Shared)
       run: |
         cd $HOME/temp
         git clone https://github.com/jedisct1/libsodium.git
@@ -125,7 +98,8 @@ jobs:
         ./autogen.sh
         
         ./configure --host=${{ env.ARCH }}-openwrt-linux \
-          --disable-ssp --disable-shared --enable-static --with-pic \
+          --enable-shared --enable-static --with-pic \
+          --disable-ssp \
           CC=${{ env.ARCH }}-openwrt-linux-musl-gcc
         
         make -j $(nproc)
@@ -139,8 +113,7 @@ jobs:
         
         ./configure \
           --host=${{ env.ARCH }}-openwrt-linux \
-          --prefix=/usr \
-          --exec-prefix=/usr \
+          --prefix=/usr --exec-prefix=/usr \
           CC=${{ env.ARCH }}-openwrt-linux-musl-gcc \
           CFLAGS="--sysroot=${{ env.TARGET_DIR }} -O2 -pipe" \
           LDFLAGS="--sysroot=${{ env.TARGET_DIR }} -Wl,--gc-sections"
@@ -161,15 +134,12 @@ jobs:
         set(CMAKE_SYSROOT $TARGET_DIR)
         include_directories(\${CMAKE_SYSROOT}/usr/include)
         EOF
-        
-        echo "Generated Toolchain File ($CMAKE_FILE):"
-        cat "$CMAKE_FILE"
 
     - name: Compile tutuicmptunnel-kmod
       run: |
         cd ${{ env.SOURCE_DIR }}
-        rm -f CMakeCache.txt
-        mkdir -p build
+        rm -f CMakeCache.txt && mkdir -p build
+        
         export PKG_CONFIG="/usr/bin/pkg-config"
         export PKG_CONFIG_LIBDIR="${{ env.TARGET_DIR }}/usr/lib/pkgconfig"
         export PKG_CONFIG_SYSROOT_DIR="${{ env.TARGET_DIR }}"
@@ -190,23 +160,19 @@ jobs:
     - name: Compile Kernel Module
       run: |
         cd ${{ env.SOURCE_DIR }}
-        
-        make \
-          KSRC=${{ env.KERNEL_DIR }} \
-          CROSS_COMPILE=${{ env.ARCH }}-openwrt-linux-musl- \
-          ARCH=${{ env.KERNEL_ARCH }} \
-          -C kmod
+        make KSRC=${{ env.KERNEL_DIR }} CROSS_COMPILE=${{ env.ARCH }}-openwrt-linux-musl- ARCH=${{ env.KERNEL_ARCH }} -C kmod
 
     - name: Prepare Artifacts
       run: |
         cd ${{ env.SOURCE_DIR }}
-        
         mkdir -p release/bin
         mkdir -p release/modules
+        mkdir -p release/lib
         
         cp stripped/usr/local/bin/tuctl* release/bin/
         cp stripped/usr/local/sbin/ktuctl release/bin/
         cp kmod/tutuicmptunnel.ko release/modules/
+        cp -d $HOME/temp/libsodium/src/libsodium/.libs/libsodium.so* release/lib/
         
         ARCH_NAME=$(echo "${{ matrix.target }}" | tr '/' '-')
         TAR_NAME="tutuicmptunnel-openwrt-${ARCH_NAME}-${{ env.SDK_VER }}.tar.gz"
