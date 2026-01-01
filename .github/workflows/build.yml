@@ -1,4 +1,4 @@
-name: Build OpenWrt All Architectures
+name: Build for OpenWrt
 
 on:
   workflow_dispatch:
